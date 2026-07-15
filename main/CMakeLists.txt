@@ -1,0 +1,13 @@
+idf_component_register(SRCS "_wifi.cpp"
+                            "ap.cpp"
+                            "button.cpp"
+                            "buzzer.cpp"
+                            "led.cpp"
+                            "main.cpp"
+                            "main_process.cpp"
+                            "memory.cpp"
+                            "rtc.cpp"
+                            "sensor.cpp"
+                            "variable.cpp"
+                       INCLUDE_DIRS "."
+                       REQUIRES esp_wifi esp_event esp_netif esp_http_server esp_http_client mqtt cjson nvs_flash esp_timer lwip esp_driver_gpio esp_driver_uart esp_driver_ledc)
