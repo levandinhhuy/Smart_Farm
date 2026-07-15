@@ -1,0 +1,24 @@
+# ESP-IDF Build Artifacts
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+dependencies.lock
+
+# ESP-IDF Managed Components (automatically downloaded during build)
+managed_components/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local IDE configuration
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
