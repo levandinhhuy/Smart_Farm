@@ -1,12 +1,14 @@
 #include "sensor.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "buzzer.h"
 
 /* -------------------------
    RS485 / UART pin config
@@ -20,6 +22,12 @@
 #define BUF_SIZE 256
 
 /* -------------------------
+   Actuator GPIO pins
+   -------------------------*/
+#define DRAINAGE_PUMP_PIN    GPIO_NUM_22 // Máy bơm xả nước rãnh
+#define IRRIGATION_VALVE_PIN GPIO_NUM_23 // Van tưới nhỏ giọt / phun mưa
+
+/* -------------------------
    Sensor Modbus defines
    -------------------------*/
 #define MODBUS_ID_DHT13       2
@@ -27,14 +35,20 @@
 #define REG_DHT13_TEMPERATURE 0x0001
 #define LEN_DHT13             2
 
-#define MODBUS_ID_RAIN  5
-#define REG_RAIN_STATUS 0x0000
-#define REG_RAIN_LL     0x0031
+#define MODBUS_ID_SOIL        3  // Multi-depth Soil Moisture Sensor (10cm, 20cm, 40cm)
+#define REG_SOIL_MOISTURE_10  0x0000
+#define REG_SOIL_MOISTURE_20  0x0001
+#define REG_SOIL_MOISTURE_40  0x0002
+#define LEN_SOIL_MOISTURE     3
 
 #define MODBUS_ID_LIGHT       4
 #define REG_LIGHT_INTENSITY_L 0x0003
 #define REG_LIGHT_INTENSITY_H 0x0004
 #define LEN_LIGHT_INTENSITY   2
+
+#define MODBUS_ID_RAIN  5
+#define REG_RAIN_STATUS 0x0000
+#define REG_RAIN_LL     0x0031
 
 #define MODBUS_ID_TDS      6
 #define REG_TDS_TEMP       0x0000
@@ -44,12 +58,24 @@
 #define REG_TDS_ECRAWAD    0x0008
 #define LEN_TDS_ECRAWAD    1
 
-DHT13_Data_t g_dht13 = {0.0f, 0.0f, false};
-Rain_Data_t  g_rain  = {0, 0, 0, 0, 0, false};
-Light_Data_t g_light = {0, false};
-TDS_Data_t   g_tds   = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
+#define MODBUS_ID_WATERLEVEL 7  // Cảm biến mực nước mương rãnh
+#define REG_WATER_LEVEL      0x0000
 
-static const char* TAG = "SENSOR";
+#define MODBUS_ID_WIND       8  // Cảm biến tốc độ gió
+#define REG_WIND_SPEED       0x0000
+
+/* Global Sensor & Actuator Data */
+DHT13_Data_t      g_dht13       = {0.0f, 0.0f, false};
+Rain_Data_t       g_rain        = {0, 0, 0, 0, 0, false};
+Light_Data_t      g_light       = {0, false};
+TDS_Data_t        g_tds         = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
+Soil_Data_t       g_soil        = {0.0f, 0.0f, 0.0f, 30.0f, 80.0f, false, false, false};
+WaterLevel_Data_t g_water_level = {0.0f, 15.0f, false, false};
+Wind_Data_t       g_wind        = {0.0f, false};
+ET_Data_t         g_et          = {0.0f, false};
+Actuator_State_t  g_actuator    = {false, false, true, true}; // Mặc định tự động
+
+static const char* TAG = "SENSOR_FARM";
 
 /* -------------------------
    CRC16 helper
@@ -137,6 +163,125 @@ static bool modbus_query(uint8_t id, uint8_t fc, uint16_t reg, uint16_t count, u
   return true;
 }
 
+/* Relay Actuator Control Functions */
+void set_drainage_pump(bool enable)
+{
+  g_actuator.drainage_pump_active = enable;
+  gpio_set_level(DRAINAGE_PUMP_PIN, enable ? 1 : 0);
+  ESP_LOGI(TAG, "Drainage Pump -> %s", enable ? "ON" : "OFF");
+}
+
+void set_irrigation_valve(bool enable)
+{
+  g_actuator.irrigation_valve_active = enable;
+  gpio_set_level(IRRIGATION_VALVE_PIN, enable ? 1 : 0);
+  ESP_LOGI(TAG, "Irrigation Valve -> %s", enable ? "ON" : "OFF");
+}
+
+/* Evapotranspiration (ET0) Calculation Algorithm */
+static void calculate_evapotranspiration(void)
+{
+  if (!g_dht13.valid || !g_light.valid)
+  {
+    g_et.valid = false;
+    return;
+  }
+
+  // Hargreaves-Samani / Penman-Monteith approximation
+  float temp = g_dht13.temperature_c;
+  float lux = (float)g_light.intensity;
+  float wind = g_wind.valid ? g_wind.speed_ms : 1.5f; // Mặc định 1.5 m/s nếu chưa có cảm biến gió
+
+  // Ước tính bức xạ mặt trời Rs (MJ/m2/day) từ Lux: 1 W/m2 ≈ 126 Lux
+  float solar_rad_mj = (lux / 126.0f) * 0.0864f; 
+  if (solar_rad_mj < 0.1f) solar_rad_mj = 0.1f;
+
+  // Công thức Hargreaves tinh chỉnh theo tốc độ gió
+  float et0 = 0.0023f * (temp + 17.8f) * sqrtf(solar_rad_mj) * (1.0f + 0.27f * wind);
+  
+  g_et.et_mm_day = et0;
+  g_et.valid = true;
+}
+
+/* Smart Farm Automation Logic */
+void update_smart_farm_automation(void)
+{
+  // 1. Kiểm tra Độ ẩm Đất Đa Tầng (10cm, 20cm, 40cm)
+  if (g_soil.valid)
+  {
+    g_soil.waterlog_alert = (g_soil.moisture_10cm > g_soil.max_threshold || 
+                             g_soil.moisture_20cm > g_soil.max_threshold || 
+                             g_soil.moisture_40cm > g_soil.max_threshold);
+                             
+    g_soil.drought_alert  = (g_soil.moisture_10cm < g_soil.min_threshold || 
+                             g_soil.moisture_20cm < g_soil.min_threshold || 
+                             g_soil.moisture_40cm < g_soil.min_threshold);
+
+    // Kích hoạt còi cảnh báo nếu có nguy cơ úng rễ hoặc héo mè
+    if (g_soil.waterlog_alert || g_soil.drought_alert)
+    {
+      buzzer_beep(300, 500);
+    }
+  }
+
+  // 2. Tính toán ET
+  calculate_evapotranspiration();
+
+  // 3. Tự động Thoát nước Mương Rãnh (Smart Drainage)
+  if (g_actuator.auto_drainage_enabled)
+  {
+    bool need_drainage = false;
+    if (g_water_level.valid && g_water_level.level_cm > g_water_level.max_safe_level)
+    {
+      need_drainage = true;
+      g_water_level.high_water_alert = true;
+    }
+    else
+    {
+      g_water_level.high_water_alert = false;
+    }
+
+    if (g_rain.valid && g_rain.status == 1 && g_soil.waterlog_alert)
+    {
+      need_drainage = true;
+    }
+
+    if (need_drainage && !g_actuator.drainage_pump_active)
+    {
+      set_drainage_pump(true);
+    }
+    else if (!need_drainage && (!g_water_level.valid || g_water_level.level_cm < (g_water_level.max_safe_level - 3.0f)) && g_actuator.drainage_pump_active)
+    {
+      set_drainage_pump(false);
+    }
+  }
+
+  // 4. Tự động Tưới nhỏ giọt / Phun mưa dựa trên ET & Độ ẩm Đất
+  if (g_actuator.auto_irrigation_enabled)
+  {
+    bool need_irrigation = false;
+    
+    // Tưới khi bị khô hạn (<30%) hoặc nhu cầu ET cao (>4.0 mm/ngày) & độ ẩm thấp
+    if (g_soil.drought_alert || (g_et.valid && g_et.et_mm_day > 4.0f && g_soil.moisture_10cm < 50.0f))
+    {
+      // An toàn: Không tưới nếu mưa hoặc ngập/úng rễ
+      if (!g_soil.waterlog_alert && !g_water_level.high_water_alert && g_rain.status == 0)
+      {
+        need_irrigation = true;
+      }
+    }
+
+    if (need_irrigation && !g_actuator.irrigation_valve_active)
+    {
+      set_irrigation_valve(true);
+    }
+    else if ((!need_irrigation || g_soil.moisture_10cm > 65.0f || g_rain.status == 1) && g_actuator.irrigation_valve_active)
+    {
+      set_irrigation_valve(false);
+    }
+  }
+}
+
 /* -------------------------
    Sensor task (RTOS)
    -------------------------*/
@@ -151,6 +296,15 @@ static void sensor_task(void* pv)
   io_conf.pin_bit_mask = (1ULL << DE_PIN);
   gpio_config(&io_conf);
   gpio_set_level((gpio_num_t)DE_PIN, 0);
+
+  // Initialize Relay GPIOs (Pump & Valve)
+  gpio_config_t relay_conf = {};
+  relay_conf.intr_type = GPIO_INTR_DISABLE;
+  relay_conf.mode = GPIO_MODE_OUTPUT;
+  relay_conf.pin_bit_mask = (1ULL << DRAINAGE_PUMP_PIN) | (1ULL << IRRIGATION_VALVE_PIN);
+  gpio_config(&relay_conf);
+  gpio_set_level(DRAINAGE_PUMP_PIN, 0);
+  gpio_set_level(IRRIGATION_VALVE_PIN, 0);
 
   // Initialize UART
   uart_config_t uart_config = {};
@@ -185,7 +339,27 @@ static void sensor_task(void* pv)
     }
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 2. Light
+    // 2. Multi-depth Soil Moisture (10cm, 20cm, 40cm)
+    uint16_t soil_regs[3];
+    bool soil_ok = modbus_query(MODBUS_ID_SOIL, 0x04, REG_SOIL_MOISTURE_10, LEN_SOIL_MOISTURE, soil_regs);
+    if (!soil_ok)
+    {
+      soil_ok = modbus_query(MODBUS_ID_SOIL, 0x03, REG_SOIL_MOISTURE_10, LEN_SOIL_MOISTURE, soil_regs);
+    }
+    if (soil_ok)
+    {
+      g_soil.moisture_10cm = (float)soil_regs[0] / 10.0f;
+      g_soil.moisture_20cm = (float)soil_regs[1] / 10.0f;
+      g_soil.moisture_40cm = (float)soil_regs[2] / 10.0f;
+      g_soil.valid         = true;
+    }
+    else
+    {
+      g_soil.valid = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 3. Light
     uint16_t light_regs[2];
     if (modbus_query(MODBUS_ID_LIGHT, 0x04, REG_LIGHT_INTENSITY_L, LEN_LIGHT_INTENSITY, light_regs))
     {
@@ -198,7 +372,7 @@ static void sensor_task(void* pv)
     }
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 3. Rain
+    // 4. Rain
     uint16_t rain_regs[1];
     if (modbus_query(MODBUS_ID_RAIN, 0x04, REG_RAIN_STATUS, 1, rain_regs))
     {
@@ -223,7 +397,7 @@ static void sensor_task(void* pv)
     }
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 4. TDS/EC
+    // 5. TDS/EC
     uint16_t tds_regs[5];
     bool ok = modbus_query(MODBUS_ID_TDS, 0x03, 0x0000, 5, tds_regs);
     if (!ok)
@@ -262,13 +436,44 @@ static void sensor_task(void* pv)
     {
       g_tds.valid = false;
     }
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    printf("DHT13[T=%.2f°C H=%.2f%% %s] | LIGHT[%u %s] | RAIN[st=%u ll=%u hy=%u rd=%u sens=%u %s] | TDS[T=%.2f°C EC=%.2f Sal=%.2f TDS=%.2f Raw=%u %s]\n",
-                  g_dht13.temperature_c, g_dht13.humidity_pct, g_dht13.valid ? "OK" : "ERR", (unsigned int)g_light.intensity, g_light.valid ? "OK" : "ERR", g_rain.status,
-                  g_rain.lower_limit, g_rain.hysteresis, g_rain.reset_delay, g_rain.sensitivity, g_rain.valid ? "OK" : "ERR", g_tds.temperature_c, g_tds.ec,
-                  g_tds.salinity, g_tds.tds, g_tds.ec_raw, g_tds.valid ? "OK" : "ERR");
+    // 6. Water Level Sensor
+    uint16_t wl_regs[1];
+    if (modbus_query(MODBUS_ID_WATERLEVEL, 0x04, REG_WATER_LEVEL, 1, wl_regs) ||
+        modbus_query(MODBUS_ID_WATERLEVEL, 0x03, REG_WATER_LEVEL, 1, wl_regs))
+    {
+      g_water_level.level_cm = (float)wl_regs[0] / 10.0f;
+      g_water_level.valid    = true;
+    }
+    else
+    {
+      g_water_level.valid = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    vTaskDelay(pdMS_TO_TICKS(3000 - 3 * 100));
+    // 7. Wind Speed Sensor
+    uint16_t wind_regs[1];
+    if (modbus_query(MODBUS_ID_WIND, 0x04, REG_WIND_SPEED, 1, wind_regs) ||
+        modbus_query(MODBUS_ID_WIND, 0x03, REG_WIND_SPEED, 1, wind_regs))
+    {
+      g_wind.speed_ms = (float)wind_regs[0] / 10.0f;
+      g_wind.valid    = true;
+    }
+    else
+    {
+      g_wind.valid = false;
+    }
+
+    // 8. Tự động hóa Smart Farm & Tính toán ET
+    update_smart_farm_automation();
+
+    printf("SOIL[10cm=%.1f%% 20cm=%.1f%% 40cm=%.1f%% %s] | WATER_LVL[%.1fcm %s] | ET[%.2f mm/day] | PUMP[%s] | VALVE[%s]\n",
+           g_soil.moisture_10cm, g_soil.moisture_20cm, g_soil.moisture_40cm, g_soil.valid ? "OK" : "ERR",
+           g_water_level.level_cm, g_water_level.valid ? "OK" : "ERR", g_et.et_mm_day,
+           g_actuator.drainage_pump_active ? "ON" : "OFF", g_actuator.irrigation_valve_active ? "ON" : "OFF");
+
+    vTaskDelay(pdMS_TO_TICKS(3000 - 6 * 100));
   }
 }
 
@@ -278,5 +483,6 @@ static void sensor_task(void* pv)
 void sensor_init(void)
 {
   xTaskCreatePinnedToCore(sensor_task, "sensor_task", 4096, NULL, 1, NULL, 1);
-  ESP_LOGI(TAG, "Initialized successfully");
+  ESP_LOGI(TAG, "Initialized Smart FarmLab sensors & automation successfully");
 }
+

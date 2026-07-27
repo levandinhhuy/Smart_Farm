@@ -653,6 +653,69 @@ static void mqtt_callback(const std::string& topic, const std::string& payload)
       }
     }
   }
+  else if (cmd_item && strcmp(cmd_item->valuestring, "control_drainage_pump") == 0)
+  {
+    cJSON *state_item = cJSON_GetObjectItem(root, "state");
+    cJSON *auto_item  = cJSON_GetObjectItem(root, "auto");
+    if (auto_item)
+    {
+      g_actuator.auto_drainage_enabled = cJSON_IsTrue(auto_item);
+    }
+    if (state_item)
+    {
+      set_drainage_pump(cJSON_IsTrue(state_item));
+    }
+
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply, "status", "success");
+    cJSON_AddStringToObject(reply, "cmd", "control_drainage_pump");
+    cJSON_AddBoolToObject(reply, "pump_active", g_actuator.drainage_pump_active);
+    cJSON_AddBoolToObject(reply, "auto_mode", g_actuator.auto_drainage_enabled);
+    char *replyStr = cJSON_PrintUnformatted(reply);
+    esp_mqtt_client_publish(mqtt_client, mqtt_topic_pub, replyStr, 0, 1, 0);
+    free(replyStr);
+    cJSON_Delete(reply);
+  }
+  else if (cmd_item && strcmp(cmd_item->valuestring, "control_irrigation_valve") == 0)
+  {
+    cJSON *state_item = cJSON_GetObjectItem(root, "state");
+    cJSON *auto_item  = cJSON_GetObjectItem(root, "auto");
+    if (auto_item)
+    {
+      g_actuator.auto_irrigation_enabled = cJSON_IsTrue(auto_item);
+    }
+    if (state_item)
+    {
+      set_irrigation_valve(cJSON_IsTrue(state_item));
+    }
+
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply, "status", "success");
+    cJSON_AddStringToObject(reply, "cmd", "control_irrigation_valve");
+    cJSON_AddBoolToObject(reply, "valve_active", g_actuator.irrigation_valve_active);
+    cJSON_AddBoolToObject(reply, "auto_mode", g_actuator.auto_irrigation_enabled);
+    char *replyStr = cJSON_PrintUnformatted(reply);
+    esp_mqtt_client_publish(mqtt_client, mqtt_topic_pub, replyStr, 0, 1, 0);
+    free(replyStr);
+    cJSON_Delete(reply);
+  }
+  else if (cmd_item && strcmp(cmd_item->valuestring, "set_soil_thresholds") == 0)
+  {
+    cJSON *min_item = cJSON_GetObjectItem(root, "min");
+    cJSON *max_item = cJSON_GetObjectItem(root, "max");
+    if (min_item) g_soil.min_threshold = (float)min_item->valuedouble;
+    if (max_item) g_soil.max_threshold = (float)max_item->valuedouble;
+
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply, "status", "success");
+    cJSON_AddStringToObject(reply, "cmd", "set_soil_thresholds");
+    cJSON_AddNumberToObject(reply, "min_threshold", g_soil.min_threshold);
+    cJSON_AddNumberToObject(reply, "max_threshold", g_soil.max_threshold);
+    char *replyStr = cJSON_PrintUnformatted(reply);
+    esp_mqtt_client_publish(mqtt_client, mqtt_topic_pub, replyStr, 0, 1, 0);
+    free(replyStr);
+    cJSON_Delete(reply);
+  }
   cJSON_Delete(root);
 }
 
@@ -694,6 +757,34 @@ void mqtt_pub_test()
   cJSON_AddNumberToObject(tds, "salinity", g_tds.salinity);
   cJSON_AddNumberToObject(tds, "tds", g_tds.tds);
   cJSON_AddNumberToObject(tds, "ec_raw", g_tds.ec_raw);
+
+  // --- Multi-depth Soil Moisture block ---
+  cJSON *soil = cJSON_AddObjectToObject(json_doc, "soil");
+  cJSON_AddBoolToObject(soil, "valid", g_soil.valid);
+  cJSON_AddNumberToObject(soil, "moisture_10cm", g_soil.moisture_10cm);
+  cJSON_AddNumberToObject(soil, "moisture_20cm", g_soil.moisture_20cm);
+  cJSON_AddNumberToObject(soil, "moisture_40cm", g_soil.moisture_40cm);
+  cJSON_AddNumberToObject(soil, "min_threshold", g_soil.min_threshold);
+  cJSON_AddNumberToObject(soil, "max_threshold", g_soil.max_threshold);
+  cJSON_AddBoolToObject(soil, "waterlog_alert", g_soil.waterlog_alert);
+  cJSON_AddBoolToObject(soil, "drought_alert", g_soil.drought_alert);
+
+  // --- Smart Drainage block ---
+  cJSON *drainage = cJSON_AddObjectToObject(json_doc, "drainage");
+  cJSON_AddBoolToObject(drainage, "valid", g_water_level.valid);
+  cJSON_AddNumberToObject(drainage, "water_level_cm", g_water_level.level_cm);
+  cJSON_AddBoolToObject(drainage, "high_water_alert", g_water_level.high_water_alert);
+  cJSON_AddBoolToObject(drainage, "pump_active", g_actuator.drainage_pump_active);
+  cJSON_AddBoolToObject(drainage, "auto_mode", g_actuator.auto_drainage_enabled);
+
+  // --- ET & Irrigation block ---
+  cJSON *irrigation = cJSON_AddObjectToObject(json_doc, "irrigation");
+  cJSON_AddBoolToObject(irrigation, "wind_valid", g_wind.valid);
+  cJSON_AddNumberToObject(irrigation, "wind_speed_ms", g_wind.speed_ms);
+  cJSON_AddBoolToObject(irrigation, "et_valid", g_et.valid);
+  cJSON_AddNumberToObject(irrigation, "et_mm_day", g_et.et_mm_day);
+  cJSON_AddBoolToObject(irrigation, "valve_active", g_actuator.irrigation_valve_active);
+  cJSON_AddBoolToObject(irrigation, "auto_mode", g_actuator.auto_irrigation_enabled);
 
   char *json_string = cJSON_PrintUnformatted(json_doc);
 
