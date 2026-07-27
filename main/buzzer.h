@@ -31,4 +31,10 @@ void buzzer_set_play_a_tone();
 void buzzer_toggle_1s();
 void buzzer_off();
 
-#endif
+void tone(int pin, int frequency);
+void noTone(int pin);
+void buzzer_set_state(bool state);
+void buzzer_beep(uint32_t length, uint32_t cooldown);
+void buzzer_alert(uint16_t freq_start, uint16_t freq_end, uint16_t step, uint32_t step_length, uint32_t cooldown);
+
+#endif
